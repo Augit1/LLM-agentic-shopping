@@ -29,6 +29,7 @@ export const Env = z
     ALLOWED_SHIPS_TO: z.string().default("US"),
     REQUIRE_YES: z.string().default("true"),
     DEFAULT_CONTEXT: z.string().default(""),
+	MAX_QUANTITY: z.coerce.number().default(5),
 
     // Logs
     MCP_DEBUG: z.string().default("0"),
