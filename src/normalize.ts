@@ -1,5 +1,3 @@
-import { parseMcpJsonContent } from "./mcp/parseContent.js";
-
 export type NormalizedVariant = {
   upid?: string;
   variantGid?: string;
@@ -13,12 +11,31 @@ export type NormalizedVariant = {
   checkoutUrl?: string;
 };
 
-type ShopifySearchPayload = {
-  offers?: any[];
-};
+type ShopifySearchPayload = { offers?: any[] };
+
+function parseShopifyMcpPayload(raw: any): ShopifySearchPayload {
+  // Shopify MCP returns: { content: [ { type:"text", text:"{...json...}" } ], isError?: boolean }
+  const isError = raw?.isError ?? raw?.result?.isError;
+  if (isError) {
+    const content = raw?.content ?? raw?.result?.content;
+    const msg =
+      Array.isArray(content) ? content.map((c: any) => c?.text).filter(Boolean).join("\n") : "MCP returned isError=true";
+    throw new Error(msg || "MCP returned isError=true");
+  }
+
+  const content = raw?.content ?? raw?.result?.content;
+  const firstText = Array.isArray(content) ? content?.[0]?.text : undefined;
+  if (!firstText) return { offers: [] };
+
+  try {
+    return JSON.parse(firstText) as ShopifySearchPayload;
+  } catch {
+    return { offers: [] };
+  }
+}
 
 export function normalizeSearchResult(raw: any, limitProducts = 3, limitVariants = 3) {
-  const payload = parseMcpJsonContent<ShopifySearchPayload>(raw);
+  const payload = parseShopifyMcpPayload(raw);
   const offers = payload?.offers ?? [];
 
   const out: Array<{ title: string; upid?: string; variants: NormalizedVariant[] }> = [];
