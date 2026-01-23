@@ -102,6 +102,93 @@ async function typewriterPrint(text: string, delayMs: number) {
   process.stdout.write("\n");
 }
 
+function hostFromUrl(url?: string | null): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).host.replace(/^www\./, "");
+  } catch {
+    return null;
+  }
+}
+
+function formatMoney(amount: number | null | undefined, currency?: string | null) {
+  if (amount == null || !Number.isFinite(amount)) return null;
+  const cur = (currency ?? "USD").toUpperCase();
+  // Keep it simple & consistent (no Intl locale surprises in CLI)
+  return cur === "USD" ? `$${amount.toFixed(2)}` : `${amount.toFixed(2)} ${cur}`;
+}
+
+function inferCondition(title: string, options: Record<string, any>) {
+  const t = (title ?? "").toLowerCase();
+  const optText = Object.entries(options ?? {})
+    .map(([k, v]) => `${k}:${v}`.toLowerCase())
+    .join(" ");
+
+  if (t.includes("refurb") || optText.includes("refurb")) return "Refurbished";
+  if (t.includes("open box") || optText.includes("open box")) return "Open box";
+  if (t.includes("used") || optText.includes("used")) return "Used";
+  if (t.includes("new") || optText.includes("new")) return "New";
+  return null;
+}
+
+function pickKeyBullets(options: Record<string, any>) {
+  // only keep a few “high signal” attributes if they exist
+  const preferredKeys = [
+    "storage",
+    "color",
+    "grade",
+    "condition",
+    "style",
+    "size",
+    "model",
+    "capacity",
+    "cover option",
+    "cosmetic condition",
+  ];
+
+  const entries = Object.entries(options ?? {});
+  const normalized = entries.map(([k, v]) => [String(k).trim(), String(v).trim()] as const);
+
+  const picked: Array<[string, string]> = [];
+  for (const pk of preferredKeys) {
+    const found = normalized.find(([k]) => k.toLowerCase() === pk.toLowerCase());
+    if (found) picked.push(found);
+    if (picked.length >= 3) break;
+  }
+
+  // fallback: take first 2 if nothing matched
+  if (picked.length === 0) {
+    for (const kv of normalized.slice(0, 2)) picked.push(kv);
+  }
+
+  return picked
+    .filter(([k, v]) => k && v)
+    .map(([k, v]) => `${k}: ${v}`);
+}
+
+function toOptionCard(v: NormalizedVariant, optionIndex: number) {
+  const seller = hostFromUrl(v.shopUrl) ?? null;
+  const money = formatMoney(v.priceUsd ?? null, v.currency ?? "USD");
+  const condition = inferCondition(v.title, v.options ?? {}) ?? (v.options?.Condition ?? null);
+
+  const bullets = pickKeyBullets(v.options ?? {});
+  if (condition && !bullets.some((b) => b.toLowerCase().startsWith("condition:"))) {
+    bullets.unshift(`Condition: ${condition}`);
+  }
+
+  return {
+    option_index: optionIndex,
+    title: v.title,
+    variant_id: v.variantId ?? null,
+    price: money,
+    currency: v.currency ?? null,
+    seller,
+    bullets: bullets.slice(0, 3),
+    // keep checkout_url internally but do NOT show it in the list
+    checkout_url: v.checkoutUrl ?? null,
+  };
+}
+
 // --------------------
 // Main
 // --------------------
@@ -219,22 +306,15 @@ async function main() {
 
       const shortlist = normalizeSearchResult(raw, 10, 10);
       const flat: NormalizedVariant[] = shortlist.flatMap((p: any) => p.variants ?? []).slice(0, limit);
+	  const cards = flat.map((v, idx) => toOptionCard(v, idx + 1));
 
+	
       // Return structured data for the LLM to reason about
       return JSON.stringify({
         ok: true,
         ships_to: shipsTo,
         query: input.query,
-        options: flat.map((v, idx) => ({
-          option_index: idx + 1,
-          title: v.title,
-          variant_id: v.variantId ?? null,
-          price_usd: v.priceUsd ?? null,
-          currency: v.currency ?? null,
-          shop_url: v.shopUrl ?? null,
-          checkout_url: v.checkoutUrl ?? null,
-          options: v.options ?? {},
-        })),
+        options: cards,
       });
     },
     {
@@ -296,7 +376,19 @@ async function main() {
       "- When showing product options, keep them concise and label them as option 1, option 2, etc.",
       "- When showing options, DO NOT include checkout links.",
       "- Ask the user to choose an option before proceeding.",
-      "- Only open a checkout link AFTER the user has chosen an option.",
+	  "When tools return product options, you MUST present them using this exact template:",
+	  "",
+	  "Option {option_index} — {title} — {price}",
+	  "- {bullet 1}",
+	  "- {bullet 2}",
+	  "- {bullet 3}",
+	  "",
+	  "Rules for options display:",
+	  "- Show at most 8 options unless the user asks for more.",
+	  "- DO NOT include checkout links when listing options.",
+	  "- After showing options, ask naturally which one they want and the quantity (e.g. 'Which one should I grab, and how many?').",
+	  "- Never invent bullets or prices: only use fields returned by tools.",
+      "- Open a checkout link after the user has chosen an option.",
       "",
       "The checkout page handles final confirmation and payment."
     ].join("\n"),
