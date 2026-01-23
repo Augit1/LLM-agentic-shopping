@@ -2,9 +2,17 @@
 import { z } from "zod";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import type { McpClient } from "../mcp/types.js";
-import { resolveToolName } from "../mcp/discovery.js";
 import { mcpErrorMessage } from "../utils/mcp.js";
 import { parseMcpJsonText } from "../utils/mcpContent.js";
+
+/**
+ * IMPORTANT:
+ * Streamable HTTP Browser MCPs (202 Accepted + SSE)
+ * do NOT support synchronous tools/list.
+ *
+ * Therefore we DO NOT call resolveToolName here.
+ * We assume standard tool names.
+ */
 
 type ReadPagePayload = {
   url?: string;
@@ -17,11 +25,9 @@ type ReadPagePayload = {
 export async function buildBrowserTools(opts: { browser: McpClient }) {
   const { browser } = opts;
 
-  const readToolName =
-    (await resolveToolName(browser, ["read_page", "page_read", "extract_text", "read", "content"])) ?? "read_page";
-
-  const openToolName =
-    (await resolveToolName(browser, ["goto", "open", "navigate"])) ?? null;
+  // Hard-coded tool names (correct for most browser MCPs)
+  const READ_TOOL = "read_page";
+  const OPEN_TOOL = "open";
 
   const BrowserReadInput = z.object({
     url: z.string().url(),
@@ -29,14 +35,15 @@ export async function buildBrowserTools(opts: { browser: McpClient }) {
 
   const browser_read = new DynamicStructuredTool({
     name: "browser_read",
-    description: "Fetch and extract readable content from a URL (for summarizing / answering questions about a page).",
+    description:
+      "Fetch and extract readable content from a web page for summarization or analysis.",
     schema: BrowserReadInput as any,
     func: async (input: any): Promise<string> => {
       let raw: any;
       try {
-        raw = await browser.callTool(readToolName, { url: input.url });
+        raw = await browser.callTool(READ_TOOL, { url: input.url });
       } catch (e: any) {
-        return JSON.stringify({ ok: false, error: `Browser MCP failed: ${e?.message ?? String(e)}` });
+        return JSON.stringify({ ok: false, error: e?.message ?? String(e) });
       }
 
       const maybeErr = mcpErrorMessage(raw);
@@ -58,22 +65,18 @@ export async function buildBrowserTools(opts: { browser: McpClient }) {
     url: z.string().url(),
   });
 
-  const browser_open: any = new DynamicStructuredTool({
+  const browser_open = new DynamicStructuredTool({
     name: "browser_open",
-    description:
-      "Open/navigate to a URL in the browser MCP session (if supported). Usually used before further interactions.",
+    description: "Open or navigate to a URL in the browser session.",
     schema: BrowserOpenInput as any,
     func: async (input: any): Promise<string> => {
-      if (!openToolName) {
-        return JSON.stringify({ ok: false, error: "Browser MCP does not expose an open/goto tool." });
-      }
       try {
-        const raw = await browser.callTool(openToolName, { url: input.url });
+        const raw = await browser.callTool(OPEN_TOOL, { url: input.url });
         const maybeErr = mcpErrorMessage(raw);
         if (maybeErr) return JSON.stringify({ ok: false, error: maybeErr });
         return JSON.stringify({ ok: true, url: input.url });
       } catch (e: any) {
-        return JSON.stringify({ ok: false, error: `Browser MCP failed: ${e?.message ?? String(e)}` });
+        return JSON.stringify({ ok: false, error: e?.message ?? String(e) });
       }
     },
   });
@@ -81,6 +84,5 @@ export async function buildBrowserTools(opts: { browser: McpClient }) {
   return {
     schemas: { BrowserReadInput, BrowserOpenInput },
     tools: { browser_read, browser_open },
-    meta: { readToolName, openToolName },
   };
 }

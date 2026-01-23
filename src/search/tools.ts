@@ -1,5 +1,6 @@
 // src/search/tools.ts
 import { z } from "zod";
+import { DynamicStructuredTool } from "@langchain/core/tools";
 import { createTavilyClient } from "./client.js";
 
 export async function buildSearchTools() {
@@ -11,15 +12,13 @@ export async function buildSearchTools() {
     depth: z.enum(["basic", "advanced"]).optional(),
   });
 
-  const web_search = {
+  const web_search = new DynamicStructuredTool({
     name: "web_search",
     description:
-      "Search the web for up-to-date information. Use when the user asks for comparisons, sources, recent info, or you need to verify something.",
-    schema: WebSearchInput,
-    async invoke(args: unknown) {
-      const input = WebSearchInput.parse(args);
+      "Search the web for up-to-date information. Use for recent launches, trends, comparisons, or verification.",
+    schema: WebSearchInput as any,
+    func: async (input: any): Promise<string> => {
       const limit = input.limit ?? 5;
-
       try {
         const out = await tavily.search({
           query: input.query,
@@ -29,28 +28,22 @@ export async function buildSearchTools() {
           include_raw_content: false,
         });
 
-        const results = (out.results ?? []).slice(0, limit).map((r) => ({
-          title: r.title ?? null,
-          url: r.url ?? null,
-          snippet: r.content ?? null,
-        }));
-
         return JSON.stringify({
           ok: true,
           query: input.query,
-		  answer: out.answer ?? null,
-          results: (out.results ?? []).slice(0, limit).map(r => ({
-    		title: r.title ?? null,
-    		url: r.url ?? null,
-    		snippet: r.content ?? null,
-    		score: r.score ?? null,
-		  })),
+          answer: out.answer ?? null,
+          results: (out.results ?? []).slice(0, limit).map((r) => ({
+            title: r.title ?? null,
+            url: r.url ?? null,
+            snippet: r.content ?? null,
+            score: r.score ?? null,
+          })),
         });
       } catch (e: any) {
         return JSON.stringify({ ok: false, error: e?.message ?? String(e) });
       }
     },
-  };
+  });
 
   return {
     schemas: { WebSearchInput },
