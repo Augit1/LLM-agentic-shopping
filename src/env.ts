@@ -24,6 +24,14 @@ export const Env = z
     CATALOG_MCP_CMD: z.string().optional(),
     CHECKOUT_MCP_CMD: z.string().optional(),
 
+	// Web Search MCP (HTTP)
+	TAVILY_API_URL: z.string().optional(),
+	TAVILY_API_KEY: z.string().optional(), 
+	
+	// Browser MCP (HTTP)
+	BROWSER_MCP_URL: z.string().optional(),
+	BROWSER_MCP_API_KEY: z.string().optional(), 
+
     // Safety / policy
     MAX_TOTAL_USD: z.coerce.number().default(50),
     ALLOWED_SHIPS_TO: z.string().default("US"),

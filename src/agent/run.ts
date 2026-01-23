@@ -10,6 +10,12 @@ import { createShopifyMcpClients } from "../shopify/mcp.js";
 import { buildShopifyTools } from "../shopify/tools.js";
 import { systemPrompt } from "./prompt.js";
 
+import { buildSearchTools } from "../search/tools.js";
+
+import { createBrowserMcpClient } from "../browser/mcp.js";
+import { buildBrowserTools } from "../browser/tools.js";
+
+
 function toolResultToString(x: unknown): string {
   if (typeof x === "string") return x;
   if (x && typeof x === "object" && "content" in x) {
@@ -21,31 +27,49 @@ function toolResultToString(x: unknown): string {
 
 export async function runAgent() {
   // Keep your bearer logic exactly (auto-refresh via token manager)
+  // --- MCP clients ---
   const tokenMgr = new ShopifyTokenManager({
     cachePath: Env.TOKEN_CACHE_PATH,
     refreshSkewMs: 2 * 60 * 1000,
   });
-
+  
   const CHAR_DELAY_MS = Number(process.env.OUTPUT_CHAR_DELAY_MS ?? "0");
-
-  if (DEBUG) {
-    const envBearer = cleanToken(process.env.BEARER_TOKEN ?? "");
-    const parsedBearer = cleanToken(Env.BEARER_TOKEN ?? "");
-    console.log("[transport]", Env.MCP_TRANSPORT);
-    console.log("[catalog url/cmd]", Env.CATALOG_MCP_URL ?? Env.CATALOG_MCP_CMD);
-    console.log("[process.env bearer fp]", envBearer ? tokenFingerprint(envBearer) : "(none)");
-    console.log("[Env.BEARER fp]        ", parsedBearer ? tokenFingerprint(parsedBearer) : "(none)");
-    console.log("[token cache path]", Env.TOKEN_CACHE_PATH);
-  }
-
+  
   const { catalog } = await createShopifyMcpClients(tokenMgr);
-  const { schemas, tools } = buildShopifyTools({ catalog });
-
+  
+  // Optional MCPs (only enabled if URL exists)
+  const searchClient = Env.TAVILY_API_URL
+    ? await buildSearchTools()
+    : null;
+  
+  const browserClient = Env.BROWSER_MCP_URL
+    ? await createBrowserMcpClient()
+    : null;
+  
+  // --- Tool builders ---
+  const shopify = buildShopifyTools({ catalog });
+  
+  const search = Env.TAVILY_API_KEY
+	? await buildSearchTools()
+	: null;
+  
+  const browser = browserClient
+    ? await buildBrowserTools({ browser: browserClient })
+    : null;
+  
+  // --- Bind all tools ---
+  const allTools = [
+    ...Object.values(shopify.tools),
+    ...(search ? Object.values(search.tools) : []),
+    ...(browser ? Object.values(browser.tools) : []),
+  ];
+  
+  // --- LLM ---
   const llm = new ChatOllama({
     baseUrl: Env.OLLAMA_URL,
     model: Env.OLLAMA_MODEL,
     temperature: 0.3,
-  }).bindTools([tools.shopify_search, tools.adjust_checkout_quantity, tools.open_in_browser]);
+  }).bindTools(allTools);
 
   const { ask } = makeCli();
 
@@ -74,14 +98,14 @@ export async function runAgent() {
           let result = "";
           try {
             if (call.name === "shopify_search") {
-              schemas.ShopifySearchInput.parse(call.args);
-              result = toolResultToString(await tools.shopify_search.invoke(call.args));
+              shopify.schemas.ShopifySearchInput.parse(call.args);
+              result = toolResultToString(await shopify.tools.shopify_search.invoke(call.args));
             } else if (call.name === "adjust_checkout_quantity") {
-              schemas.CheckoutLinkInput.parse(call.args);
-              result = toolResultToString(await tools.adjust_checkout_quantity.invoke(call.args));
+              shopify.schemas.CheckoutLinkInput.parse(call.args);
+              result = toolResultToString(await shopify.tools.adjust_checkout_quantity.invoke(call.args));
             } else if (call.name === "open_in_browser") {
-              schemas.OpenInBrowserInput.parse(call.args);
-              result = toolResultToString(await tools.open_in_browser.invoke(call.args));
+              shopify.schemas.OpenInBrowserInput.parse(call.args);
+              result = toolResultToString(await shopify.tools.open_in_browser.invoke(call.args));
             } else {
               result = JSON.stringify({ ok: false, error: `Unknown tool: ${call.name}` });
             }
