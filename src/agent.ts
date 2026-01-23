@@ -90,6 +90,18 @@ function withQuantityInCheckoutUrl(checkoutUrl: string, qty: number) {
   return checkoutUrl.replace(/\/cart\/(\d+):(\d+)/, (_m, vid) => `/cart/${vid}:${q}`);
 }
 
+async function typewriterPrint(text: string, delayMs: number) {
+  if (!delayMs || delayMs <= 0) {
+    process.stdout.write(text + "\n");
+    return;
+  }
+  for (const ch of text) {
+    process.stdout.write(ch);
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  process.stdout.write("\n");
+}
+
 // --------------------
 // Main
 // --------------------
@@ -100,6 +112,8 @@ async function main() {
     cachePath: Env.TOKEN_CACHE_PATH,
     refreshSkewMs: 2 * 60 * 1000,
   });
+
+  const CHAR_DELAY_MS = Number(process.env.OUTPUT_CHAR_DELAY_MS ?? "0");
 
   if (DEBUG) {
     const envBearer = cleanToken(process.env.BEARER_TOKEN ?? "");
@@ -131,6 +145,27 @@ async function main() {
   const catalog = await createMcp(Env.CATALOG_MCP_URL ?? Env.CATALOG_MCP_CMD ?? "", "catalog");
   const checkout = await createMcp(Env.CHECKOUT_MCP_URL ?? Env.CHECKOUT_MCP_CMD ?? "", "checkout");
   void checkout;
+
+  const OpenInBrowserInput = z.object({
+    url: z.string().min(1),
+  });
+  
+  const open_in_browser = tool(
+    async (input) => {
+      const url = input.url.trim();
+      if (!AUTO_OPEN_CHECKOUT) {
+        return JSON.stringify({ ok: false, message: "AUTO_OPEN_CHECKOUT is disabled." });
+      }
+      openUrl(url);
+      return JSON.stringify({ ok: true });
+    },
+    {
+      name: "open_in_browser",
+      description:
+        "Open a URL in the user's default browser. Only use this after the user explicitly asked to open it, or after they chose an option and asked to proceed.",
+      schema: OpenInBrowserInput,
+    }
+  );
 
   // --------------------
   // LangChain tools
@@ -237,7 +272,7 @@ async function main() {
     baseUrl: Env.OLLAMA_URL,
     model: Env.OLLAMA_MODEL,
     temperature: 0.3,
-  }).bindTools([shopify_search, adjust_checkout_quantity]);
+  }).bindTools([shopify_search, adjust_checkout_quantity, open_in_browser]);
 
   // --------------------
   // Conversation loop (agentic tool calling)
@@ -248,17 +283,24 @@ async function main() {
 
   const messages: BaseMessage[] = [
     new AIMessage(
-      [
-        "You are a helpful assistant running locally.",
-        "You can chat normally about anything.",
-        "When the user wants to find/buy something, you MAY call tools to search Shopify and provide options and checkout links.",
-        "If shipping country is unclear, ask a short question.",
-        "Never invent IDs or prices.",
-        "If you provide a checkout link and AUTO_OPEN_CHECKOUT is true, the program may open it in a browser.",
-        "",
-        "When you show options, keep it concise and reference them as option 1, option 2, etc.",
-      ].join("\n"),
-    ),
+    [
+      "You are a helpful assistant running locally.",
+      "You can chat naturally about any topic.",
+      "",
+      "When the user wants to find or buy something, you MAY decide to call external tools (such as Shopify) if useful.",
+      "Do not call tools unless they are relevant to the user’s request.",
+      "",
+      "Rules:",
+      "- Never invent product IDs, variant IDs, prices, or availability.",
+      "- If shipping country is unclear, ask a short clarification question.",
+      "- When showing product options, keep them concise and label them as option 1, option 2, etc.",
+      "- When showing options, DO NOT include checkout links.",
+      "- Ask the user to choose an option before proceeding.",
+      "- Only open a checkout link AFTER the user has chosen an option.",
+      "",
+      "The checkout page handles final confirmation and payment."
+    ].join("\n"),
+	),
   ];
 
   console.log("Local agent ready. Ask me anything.\n");
@@ -294,6 +336,9 @@ async function main() {
             } else if (call.name === "adjust_checkout_quantity") {
               CheckoutLinkInput.parse(call.args);
               result = await adjust_checkout_quantity.invoke(call.args);
+			} else if (call.name === "open_in_browser") {
+				OpenInBrowserInput.parse(call.args);
+				result = await open_in_browser.invoke(call.args);
             } else {
               result = JSON.stringify({ ok: false, error: `Unknown tool: ${call.name}` });
             }
@@ -317,21 +362,7 @@ async function main() {
       finalText = "I got stuck. Can you rephrase what you want?";
     }
 
-    // Optional: if assistant is about to open a checkout link, enforce policy best-effort
-    // We only enforce if we can infer price + quantity; otherwise we skip.
-    // (You can remove this block if you want zero guardrails.)
-    try {
-      // If the assistant output includes a checkout URL, we can open it.
-      const url = tryExtractFirstUrl(finalText);
-      if (url && AUTO_OPEN_CHECKOUT) {
-        // No price here; we don't block opening, but keep your policy enforcement for “picked option” cases inside tool output.
-        openUrl(url);
-      }
-    } catch {
-      // ignore
-    }
-
-    console.log(finalText);
+    await typewriterPrint(finalText, CHAR_DELAY_MS);
   }
 }
 
