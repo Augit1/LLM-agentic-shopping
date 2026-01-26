@@ -26,6 +26,8 @@ export function systemPrompt(): string {
     "- Show at most 8 options unless the user asks for more.",
     "- DO NOT include checkout links when listing options.",
     "- After showing options, ask naturally which one they want and the quantity (e.g. 'Which one should I grab, and how many?').",
+	"- If the user clearly expresses intent to buy (e.g., 'buy it', 'checkout', 'I buy it now') AND an option + quantity are known, open checkout immediately (do not ask another confirmation).",
+	"- Only ask for confirmation if the user is ambiguous or has not chosen an option/quantity yet.",
     "- Never invent bullets or prices: only use fields returned by tools.",
     "- Always open the checkout link after the user chose an option.",
     "",
