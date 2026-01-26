@@ -1,6 +1,7 @@
 import { ChatOllama } from "@langchain/ollama";
 import {
   HumanMessage,
+  AIMessage,
   ToolMessage,
   SystemMessage,
   type BaseMessage,
@@ -32,7 +33,6 @@ let plannerLlm: ChatOllama | null = null;
 let toolRegistry: Map<string, ToolEntry> | null = null;
 let shopifyTools: ReturnType<typeof buildShopifyTools> | null = null;
 let plannerPrompt: string | null = null;
-let messages: BaseMessage[] = [];
 
 function isLikelyCheckoutUrl(url: string): boolean {
   try {
@@ -128,8 +128,6 @@ async function initializeAgent() {
   );
   plannerPrompt = plannerSystemPrompt(toolNamesForPlanner);
 
-  messages = [new SystemMessage(systemPrompt())];
-
   agentInitialized = true;
 }
 
@@ -184,6 +182,20 @@ function extractProductOptions(text: string): ProductOption[] | null {
   return options.length > 0 ? options : null;
 }
 
+/**
+ * Convert frontend Message format to LangChain BaseMessage format
+ */
+function convertHistoryToBaseMessages(history: Message[]): BaseMessage[] {
+  return history.map((msg) => {
+    if (msg.role === "user") {
+      return new HumanMessage(msg.content);
+    } else {
+      // Assistant messages are AIMessage in LangChain
+      return new AIMessage(msg.content);
+    }
+  });
+}
+
 export async function runAgentMessage(
   userMessage: string,
   history: Message[]
@@ -194,6 +206,14 @@ export async function runAgentMessage(
     throw new Error("Agent not initialized");
   }
 
+  // Initialize messages with system prompt and conversation history
+  const messages: BaseMessage[] = [new SystemMessage(systemPrompt())];
+  
+  // Convert and add history to maintain conversation context
+  const historyMessages = convertHistoryToBaseMessages(history);
+  messages.push(...historyMessages);
+  
+  // Add the current user message
   messages.push(new HumanMessage(userMessage));
 
   // Update selection state
