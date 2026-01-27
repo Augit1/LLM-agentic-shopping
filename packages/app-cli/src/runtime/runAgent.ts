@@ -27,7 +27,7 @@ import { decideLinkOpen } from "../../../core/src/agent/planner/linkOpen";
 import { buildCoreActionTools } from "../../../core/src/tools/actions";
 
 // app-cli local
-import { makeCli, typewriterPrint } from "../cli";
+import { makeCli, typewriterPrint, withSpinner } from "../cli";
 
 // integrations
 import { ShopifyTokenManager } from "../../../integrations-shopify/src/token";
@@ -53,7 +53,11 @@ function isLikelyCheckoutUrl(url: string): boolean {
     const u = new URL(url);
     const path = u.pathname.toLowerCase();
     const qs = u.search.toLowerCase();
-    return path.includes("/cart/") || qs.includes("payment=shop_pay") || qs.includes("checkout");
+    return (
+      path.includes("/cart/") ||
+      qs.includes("payment=shop_pay") ||
+      qs.includes("checkout")
+    );
   } catch {
     return false;
   }
@@ -68,6 +72,22 @@ function lastAssistantText(messages: BaseMessage[]): string {
     }
   }
   return "";
+}
+
+function normalizeUrlForDedupe(u: string): string {
+  try {
+    const url = new URL(u.trim());
+    // Remove noisy tracking params so "same" link doesn't open twice.
+    url.searchParams.delete("_gsid");
+    url.searchParams.delete("utm_source");
+    url.searchParams.delete("utm_medium");
+    url.searchParams.delete("utm_campaign");
+    url.searchParams.delete("utm_term");
+    url.searchParams.delete("utm_content");
+    return url.toString();
+  } catch {
+    return u.trim();
+  }
 }
 
 export async function runAgent() {
@@ -138,9 +158,29 @@ export async function runAgent() {
     });
   }
 
+  // ---- URL open de-dupe (prevents "open twice" from multiple subsystems) ----
+  const openedUrls = new Set<string>();
+
+  async function openOnce(url: string): Promise<string> {
+    const cleaned = normalizeUrlForDedupe(url);
+    if (!cleaned) return JSON.stringify({ ok: false, error: "Missing url" });
+
+    if (openedUrls.has(cleaned)) {
+      return JSON.stringify({ ok: true, opened: false, deduped: true, url: cleaned });
+    }
+
+    openedUrls.add(cleaned);
+
+    // Respect the core tool behavior (AUTO_OPEN_CHECKOUT guard lives there)
+    const out = await actions.tools.open_in_browser.invoke({ url: cleaned });
+    return toolResultToString(out);
+  }
+
   // Planner allowed tools (info gathering only)
   const plannerAllowed = new Set(["web_search", "shopify_search", "browser_read"]);
-  const toolNamesForPlanner = Array.from(toolRegistry.keys()).filter((n) => plannerAllowed.has(n));
+  const toolNamesForPlanner = Array.from(toolRegistry.keys()).filter((n) =>
+    plannerAllowed.has(n),
+  );
   const plannerPrompt = plannerSystemPrompt(toolNamesForPlanner);
 
   const { ask } = makeCli();
@@ -162,22 +202,30 @@ export async function runAgent() {
     if (qty) session.selectedQuantity = qty;
 
     // Model-based buy intent (language-agnostic)
-    const buy = await isBuyIntentModel({
-      llm: plannerLlm,
-      userText: user,
-      lastAssistantText: lastAssistantText(messages),
-      hasSelectedOption: !!session.selectedOptionIndex,
-      hasQuantity: !!session.selectedQuantity,
-      hasCheckoutUrl: !!getCheckoutUrlForOption(session, session.selectedOptionIndex ?? null),
-      debug: DEBUG,
-    });
+    const buy = await withSpinner(
+      "Classifying intent",
+      async () =>
+        isBuyIntentModel({
+          llm: plannerLlm,
+          userText: user,
+          lastAssistantText: lastAssistantText(messages),
+          hasSelectedOption: !!session.selectedOptionIndex,
+          hasQuantity: !!session.selectedQuantity,
+          hasCheckoutUrl: !!getCheckoutUrlForOption(session, session.selectedOptionIndex ?? null),
+          debug: DEBUG,
+        }),
+      { okText: "✅ Intent classified" },
+    );
 
     // Auto checkout if user wants to buy and option+qty are known
     const auto = await tryAutoCheckout({
       session,
       userText: user,
       isBuyIntent: async () => buy,
-      openInBrowser: (args: unknown) => actions.tools.open_in_browser.invoke(args),
+      openInBrowser: async (args: unknown) => {
+        const url = String((args as any)?.url ?? "").trim();
+        return openOnce(url);
+      },
       adjustCheckoutQuantity: (args: unknown) => actions.tools.adjust_checkout_quantity.invoke(args),
       debug: DEBUG,
     });
@@ -190,13 +238,18 @@ export async function runAgent() {
     // -------- Planner pass --------
     try {
       const ctx = buildPlannerContext({ session, messages });
-      const plan = await getPlanWithRepair({
-        plannerLlm,
-        systemPrompt: plannerPrompt,
-        context: ctx,
-        user,
-        debug: DEBUG,
-      });
+      const plan = await withSpinner(
+        "Planning",
+        () =>
+          getPlanWithRepair({
+            plannerLlm,
+            systemPrompt: plannerPrompt,
+            context: ctx,
+            user,
+            debug: DEBUG,
+          }),
+        { okText: "✅ Plan ready" },
+      );
 
       if (plan) {
         let planned = (plan.tool_calls ?? [])
@@ -218,7 +271,11 @@ export async function runAgent() {
           let result: string;
           try {
             if (entry.parse) entry.parse(call.args);
-            const raw = await entry.invoke(call.args);
+            const raw = await withSpinner(
+              `Running ${call.name}`,
+              () => entry.invoke(call.args),
+              { okText: `✅ ${call.name} done` },
+            );
             result = toolResultToString(raw);
           } catch (e: any) {
             result = JSON.stringify({ ok: false, error: e?.message ?? String(e) });
@@ -228,7 +285,9 @@ export async function runAgent() {
             updateSessionFromShopifyResult(session, result);
           }
 
-          messages.push(new SystemMessage(`Context from planned tool "${call.name}" (JSON): ${result}`));
+          messages.push(
+            new SystemMessage(`Context from planned tool "${call.name}" (JSON): ${result}`),
+          );
         }
       }
     } catch (e: any) {
@@ -240,23 +299,33 @@ export async function runAgent() {
     let finalText: string | null = null;
 
     for (let step = 0; step < MAX_STEPS; step++) {
-      const ai = await llm.invoke(messages);
-      const toolCalls = (ai as any).tool_calls as Array<{ id: string; name: string; args: any }> | undefined;
+      const ai = await withSpinner(
+        "Thinking",
+        async () => llm.invoke(messages),
+        { okText: "✅ Thought complete" },
+      );
+
+      const toolCalls = (ai as any).tool_calls as
+        | Array<{ id: string; name: string; args: any }>
+        | undefined;
 
       if (toolCalls && toolCalls.length > 0) {
         messages.push(ai);
 
         for (const call of toolCalls) {
-          // Guardrail: never "browser_read" a checkout/cart link; open it instead
+          // Guardrail: never "browser_read" a checkout/cart link; open it instead.
           if (
             call.name === "browser_read" &&
             call.args?.url &&
             typeof call.args.url === "string" &&
             isLikelyCheckoutUrl(call.args.url)
           ) {
-            const url = call.args.url;
-            const raw = await actions.tools.open_in_browser.invoke({ url });
-            const result = toolResultToString(raw);
+            const url = call.args.url as string;
+            const result = await withSpinner(
+              "Opening checkout",
+              () => openOnce(url),
+              { okText: "✅ Opened" },
+            );
             messages.push(new ToolMessage({ content: result, tool_call_id: call.id }));
             continue;
           }
@@ -269,7 +338,13 @@ export async function runAgent() {
           } else {
             try {
               if (entry.parse) entry.parse(call.args);
-              const raw = await entry.invoke(call.args);
+
+              const raw = await withSpinner(
+                `Running ${call.name}`,
+                () => entry.invoke(call.args),
+                { okText: `✅ ${call.name} done` },
+              );
+
               result = toolResultToString(raw);
             } catch (e: any) {
               result = JSON.stringify({ ok: false, error: e?.message ?? String(e) });
@@ -305,7 +380,8 @@ export async function runAgent() {
     if (decision.open && decision.urls.length > 0) {
       for (const url of decision.urls) {
         try {
-          await actions.tools.open_in_browser.invoke({ url });
+          // de-duped open
+          await openOnce(url);
         } catch (e: any) {
           if (DEBUG) console.log("[auto-open-url] failed:", e?.message ?? String(e));
         }

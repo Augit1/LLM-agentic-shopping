@@ -15,7 +15,7 @@ export function plannerSystemPrompt(toolNames: string[]) {
     "",
     "Tool argument contracts:",
     "- web_search(args): { query: string, limit?: number (1-10), depth?: \"basic\"|\"advanced\" }",
-    "- shopify_search(args): { query: string, ships_to: string (ISO 2-letter country code like US/ES/FR/GB) }",
+    "- shopify_search(args): { query: string, ships_to: string }",
     "- browser_read(args): { url: string }",
     "",
     "CRITICAL JSON RULES:",
@@ -37,13 +37,17 @@ export function plannerSystemPrompt(toolNames: string[]) {
     "- If the user is selecting among already-presented shop options, do NOT call web_search.",
     "- If the user wants to buy/checkout/open a checkout link for an already-presented option, plan 0 tools.",
     "- Use shopify_search when you need buyable options/prices/variants.",
-    "- Use web_search for up-to-date advice ONLY outside selection/checkout flow.",
+    "- Use web_search for up-to-date facts only when needed.",
     "",
     "Exact-match rule (IMPORTANT):",
-    "- If user asks for the EXACT same item as something in news/photos/speech (e.g., 'the exact glasses he wore'),",
+    "- If the user asks for the EXACT same item as something referenced externally (e.g., a photo, a speech, a video, a post),",
     "  you MUST plan web_search first to identify the exact brand/model/name.",
-    "  Then plan shopify_search using that exact model/name.",
-    "  If a page URL is available and verification helps, plan browser_read on the most relevant page to confirm details.",
+    "  Then plan shopify_search using that exact brand/model/name.",
+    "  If verification helps and a relevant URL exists, plan browser_read on the most relevant page to confirm details.",
+    "",
+    "Query construction rule (IMPORTANT):",
+    "- Never use placeholder strings like \"Brand Model\" or \"Example Product\" in tool args.",
+    "- Your tool args must reflect the user's request and/or information you can obtain via prior tool calls.",
     "",
     "Browser tool rule:",
     "- browser_read is ONLY for reading page text (summarize/analyze). Never use it to open a checkout/cart link.",
@@ -54,18 +58,28 @@ export function plannerSystemPrompt(toolNames: string[]) {
     "Example with 0 tools:",
     "{\"tool_calls\":[],\"rationale\":\"No tools needed.\"}",
     "",
+    "Example with 2 tools (VALID):",
+    "{\"tool_calls\":[",
+    "  {\"name\":\"web_search\",\"args\":{\"query\":\"identify exact brand and model of the item referenced by the user\",\"limit\":5,\"depth\":\"advanced\"}},",
+    "  {\"name\":\"shopify_search\",\"args\":{\"query\":\"<exact brand> <exact model>\",\"ships_to\":\"<country code>\"}}",
+    "],\"rationale\":\"Need exact identity then buyable matches.\"}",
+    "",
     "Example with 3 tools (VALID):",
     "{\"tool_calls\":[",
-    "  {\"name\":\"web_search\",\"args\":{\"query\":\"exact brand/model of Macron glasses recent speech\",\"limit\":5,\"depth\":\"advanced\"}},",
-    "  {\"name\":\"browser_read\",\"args\":{\"url\":\"https://example.com/article\"}},",
-    "  {\"name\":\"shopify_search\",\"args\":{\"query\":\"Brand Model sunglasses\",\"ships_to\":\"US\"}}",
-    "],\"rationale\":\"Need exact ID then buyable matches.\"}",
+    "  {\"name\":\"web_search\",\"args\":{\"query\":\"identify exact brand and model of the item referenced by the user\",\"limit\":5,\"depth\":\"advanced\"}},",
+    "  {\"name\":\"browser_read\",\"args\":{\"url\":\"https://relevant-source.example/page\"}},",
+    "  {\"name\":\"shopify_search\",\"args\":{\"query\":\"<exact brand> <exact model>\",\"ships_to\":\"<country code>\"}}",
+    "],\"rationale\":\"Need exact identity, verify details, then buyable matches.\"}",
   ].join("\n");
 }
 
 function fixCommonPlannerJsonMistakes(jsonText: string): string {
   let t = jsonText;
+  // Missing object wrapper for subsequent tool calls:
+  // ... },"name":"x" ...  => ... },{"name":"x" ...
   t = t.replace(/\}\s*,\s*"name"\s*:/g, "},{\"name\":");
+  // Occasionally model closes the array early then continues with another call:
+  // ... }], "name":"x" ... => ... },{"name":"x" ...
   t = t.replace(/\]\s*,\s*"name"\s*:/g, ",{\"name\":");
   return t;
 }
@@ -93,6 +107,7 @@ async function repairPlanJsonWithLlm(args: {
     "- tool_calls must be an array of OBJECTS. Each object: {\"name\":\"...\",\"args\":{...}}",
     "- Keep tool names only from the available tools listed in the system prompt.",
     "- Keep at most 3 tool calls.",
+    "- Do NOT invent tools that aren't listed.",
   ].join("\n");
 
   const repairHuman = [
