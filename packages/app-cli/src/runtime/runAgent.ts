@@ -8,48 +8,44 @@ import {
 } from "@langchain/core/messages";
 
 // core
-import { Env, DEBUG } from "../../../core/src/env.js";
-import { systemPrompt } from "../../../core/src/agent/prompt.js";
-import { session } from "../../../core/src/agent/session/state.js";
+import { Env, DEBUG } from "../../../core/src/env";
+import { systemPrompt } from "../../../core/src/agent/prompt";
+import { session } from "../../../core/src/agent/session/state";
 import {
   updateSessionFromShopifyResult,
   getCheckoutUrlForOption,
-} from "../../../core/src/agent/session/shopifyState.js";
+} from "../../../core/src/agent/session/shopifyState";
 
-import { parseOptionChoice, parseQuantity } from "../../../core/src/agent/intent/parse.js";
-import { buildPlannerContext } from "../../../core/src/agent/planner/context.js";
-import { getPlanWithRepair, plannerSystemPrompt } from "../../../core/src/agent/planner/index.js";
-import { tryAutoCheckout } from "../../../core/src/agent/checkout/autoCheckout.js";
-import { isBuyIntentModel } from "../../../core/src/agent/intent/buyIntentModel.js";
-import { extractUrls } from "../../../core/src/agent/utils/urls.js";
-import { decideLinkOpen } from "../../../core/src/agent/planner/linkOpen.js";
+import { parseOptionChoice, parseQuantity } from "../../../core/src/agent/intent/parse";
+import { buildPlannerContext } from "../../../core/src/agent/planner/context";
+import { getPlanWithRepair, plannerSystemPrompt } from "../../../core/src/agent/planner";
+import { tryAutoCheckout } from "../../../core/src/agent/checkout/autoCheckout";
+import { isBuyIntentModel } from "../../../core/src/agent/intent/buyIntentModel";
+import { extractUrls } from "../../../core/src/agent/utils/urls";
+import { decideLinkOpen } from "../../../core/src/agent/planner/linkOpen";
 
-// new tool system
-import { ToolRegistry } from "../../../core/src/tools/registry.js";
-import { toLangChainTool } from "../../../core/src/tools/langchain.js";
-import type { ToolContext, ToolSpec } from "../../../core/src/tools/types.js";
+import { buildCoreActionTools } from "../../../core/src/tools/actions";
 
 // app-cli local
-import { makeCli, typewriterPrint } from "../cli.js";
+import { makeCli, typewriterPrint } from "../cli";
 
 // integrations
-import { ShopifyTokenManager } from "../../../integrations-shopify/src/token.js";
-import { createShopifyMcpClients } from "../../../integrations-shopify/src/mcp.js";
-import { shopifyTools } from "../../../integrations-shopify/src/tools.js";
+import { ShopifyTokenManager } from "../../../integrations-shopify/src/token";
+import { createShopifyMcpClients } from "../../../integrations-shopify/src/mcp";
+import { buildShopifyTools } from "../../../integrations-shopify/src/tools";
 
-import { buildSearchTools } from "../../../integrations-search/src/tools.js";
+import { buildSearchTools } from "../../../integrations-search/src/tools";
 
-import { createBrowserMcpClient } from "../../../integrations-browser/src/mcp.js";
-import { buildBrowserTools } from "../../../integrations-browser/src/tools.js";
+import { createBrowserMcpClient } from "../../../integrations-browser/src/mcp";
+import { buildBrowserTools } from "../../../integrations-browser/src/tools";
 
-type InvokableEntry = {
-  parse?: (args: any) => any;
-  invoke: (args: any) => Promise<any>;
+type ToolEntry = {
+  parse?: (args: unknown) => any;
+  invoke: (args: unknown) => Promise<any>;
 };
 
 function toolResultToString(x: unknown): string {
-  if (typeof x === "string") return x;
-  return JSON.stringify(x);
+  return typeof x === "string" ? x : JSON.stringify(x);
 }
 
 function isLikelyCheckoutUrl(url: string): boolean {
@@ -85,26 +81,14 @@ export async function runAgent() {
   const { catalog } = await createShopifyMcpClients(tokenMgr);
   const browserClient = Env.BROWSER_MCP_URL ? await createBrowserMcpClient() : null;
 
-  // Tool context (what ToolSpecs receive)
-  const ctx: ToolContext = {
-    env: process.env,
-    session,
-    debug: DEBUG,
-  };
-
-  // --- Shopify ToolSpecs -> ToolRegistry -> LangChain tools
-  const registry = new ToolRegistry();
-  const shopifySpecs: ToolSpec<any, any>[] = shopifyTools({ catalog });
-  registry.registerMany(shopifySpecs);
-
-  const shopifyLangChainTools = registry.list().map((s) => toLangChainTool(s, ctx));
-
-  // --- Search + Browser are still LangChain-native (for now)
+  const shopify = buildShopifyTools({ catalog });
+  const actions = buildCoreActionTools();
   const search = Env.TAVILY_API_KEY ? await buildSearchTools() : null;
   const browser = browserClient ? await buildBrowserTools({ browser: browserClient }) : null;
 
   const allTools = [
-    ...shopifyLangChainTools,
+    ...Object.values(shopify.tools),
+    ...Object.values(actions.tools),
     ...(search ? Object.values(search.tools) : []),
     ...(browser ? Object.values(browser.tools) : []),
   ] as any[];
@@ -122,37 +106,41 @@ export async function runAgent() {
     temperature: 0.0,
   });
 
-  // Unified invokable map for planner execution + tool loop execution
-  const invokables = new Map<string, InvokableEntry>();
+  // Tool registry (invoke/validate)
+  const toolRegistry = new Map<string, ToolEntry>();
 
-  // Register ToolSpecs (shopify tools)
-  for (const spec of registry.list()) {
-    invokables.set(spec.id, {
-      parse: (args: any) => spec.input.parse(args),
-      invoke: async (args: any) => {
-        const parsed = spec.input.parse(args);
-        return spec.run(ctx, parsed);
-      },
-    });
-  }
+  toolRegistry.set("shopify_search", {
+    parse: (args: unknown) => shopify.schemas.ShopifySearchInput.parse(args),
+    invoke: (args: unknown) => shopify.tools.shopify_search.invoke(args),
+  });
 
-  // Register search/browser tools (langchain tools)
+  toolRegistry.set("open_in_browser", {
+    parse: (args: unknown) => actions.schemas.OpenInBrowserInput.parse(args),
+    invoke: (args: unknown) => actions.tools.open_in_browser.invoke(args),
+  });
+
+  toolRegistry.set("adjust_checkout_quantity", {
+    parse: (args: unknown) => actions.schemas.CheckoutLinkInput.parse(args),
+    invoke: (args: unknown) => actions.tools.adjust_checkout_quantity.invoke(args),
+  });
+
   if (search) {
-    invokables.set("web_search", {
-      parse: (args: any) => search.schemas.WebSearchInput.parse(args),
-      invoke: (args: any) => search.tools.web_search.invoke(args),
+    toolRegistry.set("web_search", {
+      parse: (args: unknown) => search.schemas.WebSearchInput.parse(args),
+      invoke: (args: unknown) => search.tools.web_search.invoke(args),
     });
   }
+
   if (browser) {
-    invokables.set("browser_read", {
-      parse: (args: any) => browser.schemas.BrowserReadInput.parse(args),
-      invoke: (args: any) => browser.tools.browser_read.invoke(args),
+    toolRegistry.set("browser_read", {
+      parse: (args: unknown) => browser.schemas.BrowserReadInput.parse(args),
+      invoke: (args: unknown) => browser.tools.browser_read.invoke(args),
     });
   }
 
   // Planner allowed tools (info gathering only)
   const plannerAllowed = new Set(["web_search", "shopify_search", "browser_read"]);
-  const toolNamesForPlanner = [...invokables.keys()].filter((n) => plannerAllowed.has(n));
+  const toolNamesForPlanner = Array.from(toolRegistry.keys()).filter((n) => plannerAllowed.has(n));
   const plannerPrompt = plannerSystemPrompt(toolNamesForPlanner);
 
   const { ask } = makeCli();
@@ -173,7 +161,7 @@ export async function runAgent() {
     const qty = parseQuantity(user);
     if (qty) session.selectedQuantity = qty;
 
-    // Buy intent
+    // Model-based buy intent (language-agnostic)
     const buy = await isBuyIntentModel({
       llm: plannerLlm,
       userText: user,
@@ -184,13 +172,13 @@ export async function runAgent() {
       debug: DEBUG,
     });
 
-    // Auto checkout (uses ToolSpec IDs)
+    // Auto checkout if user wants to buy and option+qty are known
     const auto = await tryAutoCheckout({
       session,
       userText: user,
       isBuyIntent: async () => buy,
-      openInBrowser: (args: any) => invokables.get("open_in_browser")!.invoke(args),
-      adjustCheckoutQuantity: (args: any) => invokables.get("adjust_checkout_quantity")!.invoke(args),
+      openInBrowser: (args: unknown) => actions.tools.open_in_browser.invoke(args),
+      adjustCheckoutQuantity: (args: unknown) => actions.tools.adjust_checkout_quantity.invoke(args),
       debug: DEBUG,
     });
 
@@ -201,11 +189,11 @@ export async function runAgent() {
 
     // -------- Planner pass --------
     try {
-      const ctxText = buildPlannerContext({ session, messages });
+      const ctx = buildPlannerContext({ session, messages });
       const plan = await getPlanWithRepair({
         plannerLlm,
         systemPrompt: plannerPrompt,
-        context: ctxText,
+        context: ctx,
         user,
         debug: DEBUG,
       });
@@ -213,8 +201,8 @@ export async function runAgent() {
       if (plan) {
         let planned = (plan.tool_calls ?? [])
           .filter((c) => plannerAllowed.has(c.name))
-          .filter((c) => invokables.has(c.name))
-          .slice(0, 2);
+          .filter((c) => toolRegistry.has(c.name))
+          .slice(0, 3);
 
         // Auto-fill ships_to from session when missing
         planned = planned.map((c) => {
@@ -225,22 +213,22 @@ export async function runAgent() {
         });
 
         for (const call of planned) {
-          const entry = invokables.get(call.name)!;
+          const entry = toolRegistry.get(call.name)!;
 
-          let resultText: string;
+          let result: string;
           try {
             if (entry.parse) entry.parse(call.args);
             const raw = await entry.invoke(call.args);
-            resultText = toolResultToString(raw);
+            result = toolResultToString(raw);
           } catch (e: any) {
-            resultText = JSON.stringify({ ok: false, error: e?.message ?? String(e) });
+            result = JSON.stringify({ ok: false, error: e?.message ?? String(e) });
           }
 
           if (call.name === "shopify_search") {
-            updateSessionFromShopifyResult(session, resultText);
+            updateSessionFromShopifyResult(session, result);
           }
 
-          messages.push(new SystemMessage(`Context from planned tool "${call.name}" (JSON): ${resultText}`));
+          messages.push(new SystemMessage(`Context from planned tool "${call.name}" (JSON): ${result}`));
         }
       }
     } catch (e: any) {
@@ -259,20 +247,21 @@ export async function runAgent() {
         messages.push(ai);
 
         for (const call of toolCalls) {
-          // Guardrail: prevent browser_read on checkout url
+          // Guardrail: never "browser_read" a checkout/cart link; open it instead
           if (
             call.name === "browser_read" &&
             call.args?.url &&
             typeof call.args.url === "string" &&
             isLikelyCheckoutUrl(call.args.url)
           ) {
-            const raw = await invokables.get("open_in_browser")!.invoke({ url: call.args.url });
+            const url = call.args.url;
+            const raw = await actions.tools.open_in_browser.invoke({ url });
             const result = toolResultToString(raw);
             messages.push(new ToolMessage({ content: result, tool_call_id: call.id }));
             continue;
           }
 
-          const entry = invokables.get(call.name);
+          const entry = toolRegistry.get(call.name);
 
           let result: string;
           if (!entry) {
@@ -304,8 +293,8 @@ export async function runAgent() {
 
     if (!finalText) finalText = "I got stuck. Can you rephrase what you want?";
 
+    // Decide if we should auto-open URLs mentioned in the assistant message
     const urls = extractUrls(finalText);
-
     const decision = await decideLinkOpen({
       plannerLlm,
       userText: user,
@@ -316,7 +305,7 @@ export async function runAgent() {
     if (decision.open && decision.urls.length > 0) {
       for (const url of decision.urls) {
         try {
-          await invokables.get("open_in_browser")!.invoke({ url });
+          await actions.tools.open_in_browser.invoke({ url });
         } catch (e: any) {
           if (DEBUG) console.log("[auto-open-url] failed:", e?.message ?? String(e));
         }

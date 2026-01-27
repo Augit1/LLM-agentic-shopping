@@ -1,4 +1,4 @@
-// src/shopify/types.ts
+// packages/integrations-shopify/src/types.ts
 export type OptionCard = {
   option_index: number;
   title: string;
@@ -7,5 +7,6 @@ export type OptionCard = {
   currency: string | null;
   seller: string | null;
   bullets: string[];
-  checkout_url: string | null; // internal only (LLM can use it later)
+  product_url: string | null;   // <-- NEW (for browser_read verification)
+  checkout_url: string | null;  // internal only (LLM can use it later)
 };

@@ -3,13 +3,6 @@ import { ChatOllama } from "@langchain/ollama";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { PlanSchema, extractJsonObject, safeJsonParse, type Plan } from "./schema.js";
 
-/**
- * Planner prompt tuned to reduce malformed multi-call arrays.
- * Key changes:
- * - Explicitly defines that tool_calls is an ARRAY OF OBJECTS only.
- * - Adds a correct 2-tool-call example.
- * - Removes ambiguity that causes model to "continue" JSON with stray keys.
- */
 export function plannerSystemPrompt(toolNames: string[]) {
   return [
     "You are a tool planner for a local CLI assistant.",
@@ -36,7 +29,7 @@ export function plannerSystemPrompt(toolNames: string[]) {
     "- Never put \"name\" or \"args\" directly inside the array without braces.",
     "",
     "Rules:",
-    "- Plan at most 2 tool calls.",
+    "- Plan at most 3 tool calls.",
     "- Prefer at most ONE web_search (combine needs into one query).",
     "- Use tools only if they genuinely help.",
     "",
@@ -45,6 +38,12 @@ export function plannerSystemPrompt(toolNames: string[]) {
     "- If the user wants to buy/checkout/open a checkout link for an already-presented option, plan 0 tools.",
     "- Use shopify_search when you need buyable options/prices/variants.",
     "- Use web_search for up-to-date advice ONLY outside selection/checkout flow.",
+    "",
+    "Exact-match rule (IMPORTANT):",
+    "- If user asks for the EXACT same item as something in news/photos/speech (e.g., 'the exact glasses he wore'),",
+    "  you MUST plan web_search first to identify the exact brand/model/name.",
+    "  Then plan shopify_search using that exact model/name.",
+    "  If a page URL is available and verification helps, plan browser_read on the most relevant page to confirm details.",
     "",
     "Browser tool rule:",
     "- browser_read is ONLY for reading page text (summarize/analyze). Never use it to open a checkout/cart link.",
@@ -55,43 +54,22 @@ export function plannerSystemPrompt(toolNames: string[]) {
     "Example with 0 tools:",
     "{\"tool_calls\":[],\"rationale\":\"No tools needed.\"}",
     "",
-    "Example with 2 tools (VALID):",
+    "Example with 3 tools (VALID):",
     "{\"tool_calls\":[",
-    "  {\"name\":\"web_search\",\"args\":{\"query\":\"best Russian novels\",\"limit\":5,\"depth\":\"basic\"}},",
-    "  {\"name\":\"shopify_search\",\"args\":{\"query\":\"The Idiot French edition\",\"ships_to\":\"FR\"}}",
-    "],\"rationale\":\"Need recommendations and buyable options.\"}",
+    "  {\"name\":\"web_search\",\"args\":{\"query\":\"exact brand/model of Macron glasses recent speech\",\"limit\":5,\"depth\":\"advanced\"}},",
+    "  {\"name\":\"browser_read\",\"args\":{\"url\":\"https://example.com/article\"}},",
+    "  {\"name\":\"shopify_search\",\"args\":{\"query\":\"Brand Model sunglasses\",\"ships_to\":\"US\"}}",
+    "],\"rationale\":\"Need exact ID then buyable matches.\"}",
   ].join("\n");
 }
 
-/**
- * Fix common malformed planner JSON where a tool_calls array element
- * is missing curly braces around {"name":...,"args":...}.
- *
- * Example broken:
- * {"tool_calls":[{"name":"web_search","args":{...}},"name":"shopify_search","args":{...}],"rationale":"..."}
- *
- * We try to convert:
- * ... }, "name": ...  -> ... }, {"name": ...
- */
 function fixCommonPlannerJsonMistakes(jsonText: string): string {
   let t = jsonText;
-
-  // 1) Missing object wrapper for 2nd tool call:
-  // ... },"name":"shopify_search" ...  => ... },{"name":"shopify_search" ...
-  // This is the exact pattern you showed.
   t = t.replace(/\}\s*,\s*"name"\s*:/g, "},{\"name\":");
-
-  // 2) Sometimes it becomes: ... }], "name": ... (wrong nesting) after model glitches.
-  // Try to fix: tool_calls:[{...}] , "name":"x" => tool_calls:[{...},{"name":"x"
   t = t.replace(/\]\s*,\s*"name"\s*:/g, ",{\"name\":");
-
   return t;
 }
 
-/**
- * Dedicated "repair bot" prompt: takes invalid JSON and returns valid JSON.
- * This is stronger than "your previous output was invalid JSON" because we feed the invalid output.
- */
 async function repairPlanJsonWithLlm(args: {
   plannerLlm: ChatOllama;
   systemPrompt: string;
@@ -114,7 +92,7 @@ async function repairPlanJsonWithLlm(args: {
     "- Quote all keys and string values.",
     "- tool_calls must be an array of OBJECTS. Each object: {\"name\":\"...\",\"args\":{...}}",
     "- Keep tool names only from the available tools listed in the system prompt.",
-    "- Keep at most 2 tool calls.",
+    "- Keep at most 3 tool calls.",
   ].join("\n");
 
   const repairHuman = [
@@ -139,25 +117,19 @@ async function parsePlanFromText(text: string): Promise<Plan | null> {
   const jsonText = extractJsonObject(text);
   if (!jsonText) return null;
 
-  // First attempt: parse as-is
   const obj1 = safeJsonParse(jsonText);
   if (obj1) {
     try {
       return PlanSchema.parse(obj1);
-    } catch {
-      // fallthrough
-    }
+    } catch {}
   }
 
-  // Second attempt: apply heuristic fixer then parse
   const fixed = fixCommonPlannerJsonMistakes(jsonText);
   const obj2 = safeJsonParse(fixed);
   if (obj2) {
     try {
       return PlanSchema.parse(obj2);
-    } catch {
-      // fallthrough
-    }
+    } catch {}
   }
 
   return null;
@@ -182,7 +154,6 @@ export async function getPlanWithRepair(args: {
   let plan = await parsePlanFromText(firstText);
 
   if (!plan) {
-    // Repair attempt 1: strict "regenerate valid JSON" without showing invalid output
     const regen = await plannerLlm.invoke([
       new SystemMessage(systemPrompt),
       new SystemMessage(context),
@@ -196,7 +167,6 @@ export async function getPlanWithRepair(args: {
 
     plan = await parsePlanFromText(regenText);
 
-    // Repair attempt 2 (best): show the invalid JSON and ask a repair-bot to fix it
     if (!plan) {
       const repairedText = await repairPlanJsonWithLlm({
         plannerLlm,

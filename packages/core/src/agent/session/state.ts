@@ -1,4 +1,4 @@
-// src/agent/session/state.ts
+// packages/core/src/agent/session/state.ts
 export type ShopifyOption = {
   option_index: number;
   title: string;
@@ -7,6 +7,7 @@ export type ShopifyOption = {
   currency?: string;
   seller?: string;
   bullets?: string[];
+  product_url?: string;   // <-- NEW
   checkout_url?: string;
 };
 

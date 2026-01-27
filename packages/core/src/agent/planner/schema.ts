@@ -1,4 +1,4 @@
-// src/agent/planner/schema.ts
+// packages/core/src/agent/planner/schema.ts
 import { z } from "zod";
 
 export const PlannedCallSchema = z.object({
@@ -7,7 +7,8 @@ export const PlannedCallSchema = z.object({
 });
 
 export const PlanSchema = z.object({
-  tool_calls: z.array(PlannedCallSchema).max(2).default([]),
+  // was max(2)
+  tool_calls: z.array(PlannedCallSchema).max(3).default([]),
   rationale: z.string().optional(),
 });
 

@@ -1,4 +1,4 @@
-// src/shopify/cards.ts
+// packages/integrations-shopify/src/cards.ts
 import type { NormalizedVariant } from "./normalize.js";
 import type { OptionCard } from "./types.js";
 import { hostFromUrl } from "../../core/src/utils/url.js";
@@ -22,6 +22,7 @@ export function toOptionCard(v: NormalizedVariant, optionIndex: number): OptionC
     currency: v.currency ?? null,
     seller,
     bullets: bullets.slice(0, 3),
+    product_url: v.variantUrl ?? v.shopUrl ?? null,  // <-- NEW
     checkout_url: v.checkoutUrl ?? null,
   };
 }
